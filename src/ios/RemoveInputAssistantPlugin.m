@@ -10,6 +10,22 @@
 
 #pragma mark - Helpers
 
+// Helper: Recursively find the WKContentView
+// This is necessary because the view hierarchy depth can change between iOS/macOS versions
+static UIView* ATKFindContentView(UIView *view) {
+    if ([view isKindOfClass:NSClassFromString(@"WKContentView")]) {
+        return view;
+    }
+
+    for (UIView *subview in view.subviews) {
+        UIView *found = ATKFindContentView(subview);
+        if (found) {
+            return found;
+        }
+    }
+    return nil;
+}
+
 static inline WKWebView *ATKGetWK(RemoveInputAssistantPlugin *plugin) {
     id webView = nil;
 
@@ -29,16 +45,32 @@ static inline WKWebView *ATKGetWK(RemoveInputAssistantPlugin *plugin) {
 
 static void ATKHideAssistant(WKWebView *webView) {
     if (!webView) return;
-    if (![NSThread isMainThread]) { dispatch_async(dispatch_get_main_queue(), ^{ ATKHideAssistant(webView); }); return; }
 
-    // Find private WKContentView inside the WKWebView
-    for (UIView *sub in webView.scrollView.subviews) {
-        if ([sub isKindOfClass:NSClassFromString(@"WKContentView")]) {
-            UIResponder *r = (UIResponder *)sub;
-            if ([r respondsToSelector:@selector(inputAssistantItem)]) {
-                UITextInputAssistantItem *item = r.inputAssistantItem;
-                item.leadingBarButtonGroups = @[];
-                item.trailingBarButtonGroups = @[];
+    // Ensure UI updates happen on Main Thread
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            ATKHideAssistant(webView);
+        });
+        return;
+    }
+
+    // Search recursively starting from the ScrollView
+    UIView *contentView = ATKFindContentView(webView.scrollView);
+
+    if (contentView) {
+        UIResponder *r = (UIResponder *)contentView;
+        if ([r respondsToSelector:@selector(inputAssistantItem)]) {
+            UITextInputAssistantItem *item = r.inputAssistantItem;
+
+            // Remove the groups to hide the buttons
+            item.leadingBarButtonGroups = @[];
+            item.trailingBarButtonGroups = @[];
+
+            // Ideally we also want to hide the bar entirely if empty,
+            // though strict control over this varies by OS version.
+            if ([item respondsToSelector:@selector(setAllowsHidingShortcuts:)]) {
+                 // Common on iPad/Catalyst to allow collapsing
+                 item.allowsHidingShortcuts = YES;
             }
         }
     }
@@ -80,7 +112,7 @@ static void ATKHideAssistant(WKWebView *webView) {
         @"  const post = () => { try { webkit.messageHandlers.__atkFocus.postMessage(1); } catch(e){} };"
         @"  window.addEventListener('focusin', post, true);"
         @"  document.addEventListener('visibilitychange', function(){ if(!document.hidden) post(); }, true);"
-        @"  setTimeout(post, 0);"
+        @"  setTimeout(post, 100);" // Slight delay to catch race conditions
         @"})();";
 
         WKUserScript *script = [[WKUserScript alloc] initWithSource:js
@@ -144,10 +176,11 @@ NS_INLINE BOOL IsiOSAppOnMac(void) {
 #if TARGET_OS_MACCATALYST
     return YES;
 #else
-    SEL sel = NSSelectorFromString(@"isiOSAppOnMac");
-    if ([[NSProcessInfo processInfo] respondsToSelector:sel]) {
-        BOOL (*msgSend)(id, SEL) = (BOOL (*)(id, SEL))objc_msgSend;
-        return msgSend([NSProcessInfo processInfo], sel);
+    if (@available(iOS 14.0, *)) {
+        NSProcessInfo *pi = [NSProcessInfo processInfo];
+        if ([pi respondsToSelector:@selector(isiOSAppOnMac)]) {
+            return pi.isiOSAppOnMac;
+        }
     }
     return NO;
 #endif
